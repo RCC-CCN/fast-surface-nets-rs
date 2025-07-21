@@ -1,0 +1,41 @@
+{
+  "name": "Bevy Game Dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    // Wayland support
+    "--device", "/dev/dri",
+    "--device", "/dev/snd",
+    "--privileged" // It may or not be necessary to run the container in privileged mode
+],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash",
+        "editor.tabSize": 2,
+        "editor.insertSpaces": true,
+        "files.autoSave": "off"
+        // "files.trimTrailingWhitespace": true,
+        // "files.trimFinalNewlines": true,
+        // "rust-analyzer.cargo.loadOutDirsFromCheck": true,
+        // "rust-analyzer.checkOnSave.command": "clippy",
+        // "rust-analyzer.checkOnSave.allTargets": true
+      },
+      "extensions": [
+        "mhutchie.git-graph",
+        "eamodio.gitlens",
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "fill-labs.dependi",
+        "usernamehw.errorlens",
+        "harehare.portable-kanban"
+      ]
+    }
+  },
+  //"postCreateCommand": "rustup target add wasm32-unknown-unknown || true",
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+}
