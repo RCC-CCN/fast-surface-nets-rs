@@ -508,6 +508,19 @@ fn generate_boundary_vertices<T, S>(
     T: SignedDistance,
     S: Shape<3, Coord = u32>,
 {
+    // Use a map to track vertex positions and avoid duplicates
+    use std::collections::HashMap;
+    let mut position_to_index: HashMap<[u32; 3], u32> = HashMap::new();
+    
+    // First, map existing vertices to their positions
+    for (stride_idx, &vertex_idx) in output.stride_to_index.iter().enumerate() {
+        if vertex_idx != NULL_VERTEX {
+            // Find the 3D position from the stride
+            let coords = shape.delinearize(stride_idx as u32);
+            position_to_index.insert(coords, vertex_idx);
+        }
+    }
+    
     // Check boundary voxels and create vertices for negative SDF values
     for z in minz..maxz {
         for y in miny..maxy {
@@ -517,13 +530,13 @@ fn generate_boundary_vertices<T, S>(
                 if is_boundary {
                     let stride = shape.linearize([x, y, z]);
                     
-                    // Only create boundary vertex if not already created by surface estimation
+                    // Only create boundary vertex if not already created
                     if output.stride_to_index[stride as usize] == NULL_VERTEX {
                         let sdf_value = unsafe { sdf.get_unchecked(stride as usize) };
                         
                         if sdf_value.is_negative() {
-                            // Create vertex at the boundary plane, not at voxel center
-                            let pos = if x == minx {
+                            // Calculate the target boundary position
+                            let boundary_pos = if x == minx {
                                 [minx as f32, y as f32 + 0.5, z as f32 + 0.5]
                             } else if x == maxx - 1 {
                                 [(maxx - 1) as f32 + 1.0, y as f32 + 0.5, z as f32 + 0.5]
@@ -537,26 +550,44 @@ fn generate_boundary_vertices<T, S>(
                                 [x as f32 + 0.5, y as f32 + 0.5, (maxz - 1) as f32 + 1.0]
                             };
                             
-                            // Calculate boundary normal (pointing outward)
-                            let normal = if x == minx {
-                                [-1.0, 0.0, 0.0]
-                            } else if x == maxx - 1 {
-                                [1.0, 0.0, 0.0]
-                            } else if y == miny {
-                                [0.0, -1.0, 0.0]
-                            } else if y == maxy - 1 {
-                                [0.0, 1.0, 0.0]
-                            } else if z == minz {
-                                [0.0, 0.0, -1.0]
+                            // Check if we already have a vertex at this exact position
+                            let mut existing_vertex_idx = None;
+                            for (i, &pos) in output.positions.iter().enumerate() {
+                                if (pos[0] - boundary_pos[0]).abs() < 0.001 
+                                    && (pos[1] - boundary_pos[1]).abs() < 0.001 
+                                    && (pos[2] - boundary_pos[2]).abs() < 0.001 {
+                                    existing_vertex_idx = Some(i as u32);
+                                    break;
+                                }
+                            }
+                            
+                            let vertex_idx = if let Some(idx) = existing_vertex_idx {
+                                // Reuse existing vertex
+                                idx
                             } else {
-                                [0.0, 0.0, 1.0]
+                                // Create new vertex
+                                let normal = if x == minx {
+                                    [-1.0, 0.0, 0.0]
+                                } else if x == maxx - 1 {
+                                    [1.0, 0.0, 0.0]
+                                } else if y == miny {
+                                    [0.0, -1.0, 0.0]
+                                } else if y == maxy - 1 {
+                                    [0.0, 1.0, 0.0]
+                                } else if z == minz {
+                                    [0.0, 0.0, -1.0]
+                                } else {
+                                    [0.0, 0.0, 1.0]
+                                };
+                                
+                                output.positions.push(boundary_pos);
+                                output.normals.push(normal);
+                                output.surface_points.push([x, y, z]);
+                                output.surface_strides.push(stride);
+                                (output.positions.len() - 1) as u32
                             };
                             
-                            output.positions.push(pos);
-                            output.normals.push(normal);
-                            output.stride_to_index[stride as usize] = output.positions.len() as u32 - 1;
-                            output.surface_points.push([x, y, z]);
-                            output.surface_strides.push(stride);
+                            output.stride_to_index[stride as usize] = vertex_idx;
                         }
                     }
                 }
