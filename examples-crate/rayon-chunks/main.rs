@@ -2,7 +2,7 @@ use fast_surface_nets::glam::Vec3A;
 use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};
 use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
 use ilattice::prelude::*;
-use rand::{Rng, rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::io::Result;
 use std::time;

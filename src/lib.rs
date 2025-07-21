@@ -26,7 +26,7 @@
 //!
 //! ```
 //! use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};
-//! use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
+//! use fast_surface_nets::{surface_nets, surface_nets_with_config, SurfaceNetsBuffer, SurfaceNetsConfig};
 //!
 //! // A 16^3 chunk with 1-voxel boundary padding.
 //! type ChunkShape = ConstShape3u32<18, 18, 18>;
@@ -43,6 +43,16 @@
 //!
 //! // Some triangles were generated.
 //! assert!(!buffer.indices.is_empty());
+//!
+//! // For watertight meshes, use surface_nets_with_config:
+//! let mut watertight_buffer = SurfaceNetsBuffer::default();
+//! let config = SurfaceNetsConfig {
+//!     generate_boundary_faces: true,
+//! };
+//! surface_nets_with_config(&sdf, &ChunkShape {}, [0; 3], [17; 3], config, &mut watertight_buffer);
+//!
+//! // The watertight mesh will have more triangles due to boundary faces.
+//! assert!(watertight_buffer.indices.len() >= buffer.indices.len());
 //! ```
 
 pub use glam;
@@ -50,6 +60,22 @@ pub use ndshape;
 
 use glam::{Vec3A, Vec3Swizzles};
 use ndshape::Shape;
+
+/// Configuration options for surface mesh generation.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceNetsConfig {
+    /// Whether to generate faces on the boundaries of the sampling volume to create watertight meshes.
+    /// When enabled, faces will be generated on cube boundaries where the SDF is negative.
+    pub generate_boundary_faces: bool,
+}
+
+impl Default for SurfaceNetsConfig {
+    fn default() -> Self {
+        Self {
+            generate_boundary_faces: false,
+        }
+    }
+}
 
 pub trait SignedDistance: Into<f32> + Copy {
     fn is_negative(self) -> bool;
@@ -133,6 +159,27 @@ pub fn surface_nets<T, S>(
     T: SignedDistance,
     S: Shape<3, Coord = u32>,
 {
+    surface_nets_with_config(sdf, shape, min, max, SurfaceNetsConfig::default(), output);
+}
+
+/// The Naive Surface Nets smooth voxel meshing algorithm with configuration options.
+///
+/// Extracts an isosurface mesh from the [signed distance field](https://en.wikipedia.org/wiki/Signed_distance_function) `sdf`
+/// with additional configuration options for controlling mesh generation behavior.
+///
+/// When `config.generate_boundary_faces` is true, this function will generate faces on the boundaries of the sampling volume
+/// where the SDF is negative, creating watertight meshes.
+pub fn surface_nets_with_config<T, S>(
+    sdf: &[T],
+    shape: &S,
+    min: [u32; 3],
+    max: [u32; 3],
+    config: SurfaceNetsConfig,
+    output: &mut SurfaceNetsBuffer,
+) where
+    T: SignedDistance,
+    S: Shape<3, Coord = u32>,
+{
     // SAFETY
     // Make sure the slice matches the shape before we start using get_unchecked.
     assert!(shape.linearize(min) <= shape.linearize(max));
@@ -142,6 +189,10 @@ pub fn surface_nets<T, S>(
 
     estimate_surface(sdf, shape, min, max, output);
     make_all_quads(sdf, shape, min, max, output);
+    
+    if config.generate_boundary_faces {
+        make_boundary_faces(sdf, shape, min, max, output);
+    }
 }
 
 // Find all vertex positions and normals. Also generate a map from grid position to vertex index to be used to look up vertices
@@ -420,6 +471,219 @@ fn maybe_make_quad<T>(
         [v2, v4, v3, v2, v3, v1]
     };
     indices.extend_from_slice(&quad);
+}
+
+// Generate faces on the boundaries of the sampling volume where the SDF is negative.
+// This creates watertight meshes by closing holes at the boundaries.
+fn make_boundary_faces<T, S>(
+    sdf: &[T],
+    shape: &S,
+    [minx, miny, minz]: [u32; 3],
+    [maxx, maxy, maxz]: [u32; 3],
+    output: &mut SurfaceNetsBuffer,
+) where
+    T: SignedDistance,
+    S: Shape<3, Coord = u32>,
+{
+    // First, generate boundary vertices where needed
+    generate_boundary_vertices(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], output);
+    
+    // Then generate boundary faces
+    make_boundary_faces_x(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], minx, output);
+    make_boundary_faces_x(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], maxx - 1, output);
+    make_boundary_faces_y(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], miny, output);
+    make_boundary_faces_y(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], maxy - 1, output);
+    make_boundary_faces_z(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], minz, output);
+    make_boundary_faces_z(sdf, shape, [minx, miny, minz], [maxx, maxy, maxz], maxz - 1, output);
+}
+
+// Generate boundary vertices for negative SDF values at the boundaries
+fn generate_boundary_vertices<T, S>(
+    sdf: &[T],
+    shape: &S,
+    [minx, miny, minz]: [u32; 3],
+    [maxx, maxy, maxz]: [u32; 3],
+    output: &mut SurfaceNetsBuffer,
+) where
+    T: SignedDistance,
+    S: Shape<3, Coord = u32>,
+{
+    // Check boundary voxels and create vertices for negative SDF values
+    for z in minz..maxz {
+        for y in miny..maxy {
+            for x in minx..maxx {
+                let is_boundary = x == minx || x == maxx - 1 || y == miny || y == maxy - 1 || z == minz || z == maxz - 1;
+                
+                if is_boundary {
+                    let stride = shape.linearize([x, y, z]);
+                    
+                    // Only create boundary vertex if not already created by surface estimation
+                    if output.stride_to_index[stride as usize] == NULL_VERTEX {
+                        let sdf_value = unsafe { sdf.get_unchecked(stride as usize) };
+                        
+                        if sdf_value.is_negative() {
+                            // Create vertex at the boundary plane, not at voxel center
+                            let pos = if x == minx {
+                                [minx as f32, y as f32 + 0.5, z as f32 + 0.5]
+                            } else if x == maxx - 1 {
+                                [(maxx - 1) as f32 + 1.0, y as f32 + 0.5, z as f32 + 0.5]
+                            } else if y == miny {
+                                [x as f32 + 0.5, miny as f32, z as f32 + 0.5]
+                            } else if y == maxy - 1 {
+                                [x as f32 + 0.5, (maxy - 1) as f32 + 1.0, z as f32 + 0.5]
+                            } else if z == minz {
+                                [x as f32 + 0.5, y as f32 + 0.5, minz as f32]
+                            } else { // z == maxz - 1
+                                [x as f32 + 0.5, y as f32 + 0.5, (maxz - 1) as f32 + 1.0]
+                            };
+                            
+                            // Calculate boundary normal (pointing outward)
+                            let normal = if x == minx {
+                                [-1.0, 0.0, 0.0]
+                            } else if x == maxx - 1 {
+                                [1.0, 0.0, 0.0]
+                            } else if y == miny {
+                                [0.0, -1.0, 0.0]
+                            } else if y == maxy - 1 {
+                                [0.0, 1.0, 0.0]
+                            } else if z == minz {
+                                [0.0, 0.0, -1.0]
+                            } else {
+                                [0.0, 0.0, 1.0]
+                            };
+                            
+                            output.positions.push(pos);
+                            output.normals.push(normal);
+                            output.stride_to_index[stride as usize] = output.positions.len() as u32 - 1;
+                            output.surface_points.push([x, y, z]);
+                            output.surface_strides.push(stride);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Generate boundary faces for X planes
+fn make_boundary_faces_x<T, S>(
+    sdf: &[T],
+    shape: &S,
+    [minx, miny, minz]: [u32; 3],
+    [maxx, maxy, maxz]: [u32; 3],
+    x_plane: u32,
+    output: &mut SurfaceNetsBuffer,
+) where
+    T: SignedDistance,
+    S: Shape<3, Coord = u32>,
+{
+    let is_min_face = x_plane == minx;
+    
+    for z in minz..(maxz - 1) {
+        for y in miny..(maxy - 1) {
+            // Get the four corners of the quad
+            let stride_00 = shape.linearize([x_plane, y, z]);
+            let stride_01 = shape.linearize([x_plane, y, z + 1]);
+            let stride_10 = shape.linearize([x_plane, y + 1, z]);
+            let stride_11 = shape.linearize([x_plane, y + 1, z + 1]);
+            
+            let v00 = output.stride_to_index[stride_00 as usize];
+            let v01 = output.stride_to_index[stride_01 as usize];
+            let v10 = output.stride_to_index[stride_10 as usize];
+            let v11 = output.stride_to_index[stride_11 as usize];
+            
+            // Only create faces if all vertices exist
+            if v00 != NULL_VERTEX && v01 != NULL_VERTEX && v10 != NULL_VERTEX && v11 != NULL_VERTEX {
+                if is_min_face {
+                    // Winding for min face (facing outward)
+                    output.indices.extend_from_slice(&[v00, v01, v10]);
+                    output.indices.extend_from_slice(&[v01, v11, v10]);
+                } else {
+                    // Winding for max face (facing outward)
+                    output.indices.extend_from_slice(&[v00, v10, v01]);
+                    output.indices.extend_from_slice(&[v01, v10, v11]);
+                }
+            }
+        }
+    }
+}
+
+// Generate boundary faces for Y planes
+fn make_boundary_faces_y<T, S>(
+    sdf: &[T],
+    shape: &S,
+    [minx, miny, minz]: [u32; 3],
+    [maxx, maxy, maxz]: [u32; 3],
+    y_plane: u32,
+    output: &mut SurfaceNetsBuffer,
+) where
+    T: SignedDistance,
+    S: Shape<3, Coord = u32>,
+{
+    let is_min_face = y_plane == miny;
+    
+    for z in minz..(maxz - 1) {
+        for x in minx..(maxx - 1) {
+            let stride_00 = shape.linearize([x, y_plane, z]);
+            let stride_01 = shape.linearize([x, y_plane, z + 1]);
+            let stride_10 = shape.linearize([x + 1, y_plane, z]);
+            let stride_11 = shape.linearize([x + 1, y_plane, z + 1]);
+            
+            let v00 = output.stride_to_index[stride_00 as usize];
+            let v01 = output.stride_to_index[stride_01 as usize];
+            let v10 = output.stride_to_index[stride_10 as usize];
+            let v11 = output.stride_to_index[stride_11 as usize];
+            
+            if v00 != NULL_VERTEX && v01 != NULL_VERTEX && v10 != NULL_VERTEX && v11 != NULL_VERTEX {
+                if is_min_face {
+                    output.indices.extend_from_slice(&[v00, v10, v01]);
+                    output.indices.extend_from_slice(&[v01, v10, v11]);
+                } else {
+                    output.indices.extend_from_slice(&[v00, v01, v10]);
+                    output.indices.extend_from_slice(&[v01, v11, v10]);
+                }
+            }
+        }
+    }
+}
+
+// Generate boundary faces for Z planes
+fn make_boundary_faces_z<T, S>(
+    sdf: &[T],
+    shape: &S,
+    [minx, miny, minz]: [u32; 3],
+    [maxx, maxy, maxz]: [u32; 3],
+    z_plane: u32,
+    output: &mut SurfaceNetsBuffer,
+) where
+    T: SignedDistance,
+    S: Shape<3, Coord = u32>,
+{
+    let is_min_face = z_plane == minz;
+    
+    for y in miny..(maxy - 1) {
+        for x in minx..(maxx - 1) {
+            let stride_00 = shape.linearize([x, y, z_plane]);
+            let stride_01 = shape.linearize([x, y + 1, z_plane]);
+            let stride_10 = shape.linearize([x + 1, y, z_plane]);
+            let stride_11 = shape.linearize([x + 1, y + 1, z_plane]);
+            
+            let v00 = output.stride_to_index[stride_00 as usize];
+            let v01 = output.stride_to_index[stride_01 as usize];
+            let v10 = output.stride_to_index[stride_10 as usize];
+            let v11 = output.stride_to_index[stride_11 as usize];
+            
+            if v00 != NULL_VERTEX && v01 != NULL_VERTEX && v10 != NULL_VERTEX && v11 != NULL_VERTEX {
+                if is_min_face {
+                    output.indices.extend_from_slice(&[v00, v01, v10]);
+                    output.indices.extend_from_slice(&[v01, v11, v10]);
+                } else {
+                    output.indices.extend_from_slice(&[v00, v10, v01]);
+                    output.indices.extend_from_slice(&[v01, v10, v11]);
+                }
+            }
+        }
+    }
 }
 
 const CUBE_CORNERS: [[u32; 3]; 8] = [
